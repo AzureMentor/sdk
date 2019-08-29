@@ -4,13 +4,10 @@
 
 library fasta.procedure_builder;
 
-// Note: we're deliberately using AsyncMarker and ProcedureKind from kernel
-// outside the kernel-specific builders. This is simpler than creating
-// additional enums.
-import 'package:kernel/ast.dart'
-    show AsyncMarker, ProcedureKind, VariableDeclaration;
+import 'dart:core' hide MapEntry;
 
-import 'package:kernel/type_algebra.dart' show containsTypeVariable, substitute;
+import 'package:kernel/ast.dart';
+
 import 'package:kernel/type_algebra.dart';
 
 import 'builder.dart'
@@ -25,35 +22,7 @@ import 'builder.dart'
         TypeVariableBuilder;
 
 import 'extension_builder.dart';
-
-import 'package:kernel/ast.dart'
-    show
-        Arguments,
-        AsyncMarker,
-        Class,
-        Constructor,
-        ConstructorInvocation,
-        DartType,
-        DynamicType,
-        EmptyStatement,
-        Expression,
-        FunctionNode,
-        Initializer,
-        InterfaceType,
-        Member,
-        Name,
-        Procedure,
-        ProcedureKind,
-        RedirectingInitializer,
-        Statement,
-        StaticInvocation,
-        StringLiteral,
-        SuperInitializer,
-        TreeNode,
-        TypeParameter,
-        TypeParameterType,
-        VariableDeclaration,
-        setParents;
+import 'type_variable_builder.dart';
 
 import '../../scanner/token.dart' show Token;
 
@@ -235,7 +204,7 @@ abstract class FunctionBuilder extends MemberBuilder {
 
   FunctionNode function;
 
-  Statement actualBody;
+  Statement _body;
 
   FunctionBuilder get actualOrigin;
 
@@ -247,7 +216,7 @@ abstract class FunctionBuilder extends MemberBuilder {
 //            newBody.fileOffset, fileUri);
 //      }
 //    }
-    actualBody = newBody;
+    _body = newBody;
     if (function != null) {
       // A forwarding semi-stub is a method that is abstract in the source code,
       // but which needs to have a forwarding stub body in order to ensure that
@@ -264,18 +233,18 @@ abstract class FunctionBuilder extends MemberBuilder {
   }
 
   void setRedirectingFactoryBody(Member target, List<DartType> typeArguments) {
-    if (actualBody != null) {
-      unexpected("null", "${actualBody.runtimeType}", charOffset, fileUri);
+    if (_body != null) {
+      unexpected("null", "${_body.runtimeType}", charOffset, fileUri);
     }
-    actualBody = new RedirectingFactoryBody(target, typeArguments);
-    function.body = actualBody;
-    actualBody?.parent = function;
+    _body = new RedirectingFactoryBody(target, typeArguments);
+    function.body = _body;
+    _body?.parent = function;
     if (isPatch) {
       actualOrigin.setRedirectingFactoryBody(target, typeArguments);
     }
   }
 
-  Statement get body => actualBody ??= new EmptyStatement();
+  Statement get body => _body ??= new EmptyStatement();
 
   bool get isNative => nativeMethodName != null;
 
@@ -478,6 +447,10 @@ class ProcedureBuilder extends FunctionBuilder {
 
   bool hadTypesInferred = false;
 
+  /// If this is an extension instance method then [_extensionTearOff] holds
+  /// the synthetically created tear off function.
+  Procedure _extensionTearOff;
+
   ProcedureBuilder(
       List<MetadataBuilder> metadata,
       int modifiers,
@@ -506,10 +479,63 @@ class ProcedureBuilder extends FunctionBuilder {
   AsyncMarker get asyncModifier => actualAsyncModifier;
 
   Statement get body {
-    if (actualBody == null && !isAbstract && !isExternal) {
-      actualBody = new EmptyStatement();
+    if (_body == null && !isAbstract && !isExternal) {
+      _body = new EmptyStatement();
     }
-    return actualBody;
+    return _body;
+  }
+
+  /// If this is an extension instance setter, wrap the setter body to return
+  /// the rhs value from the method.
+  ///
+  /// That is, this setter
+  ///
+  ///     extension E on A {
+  ///       void set property(B value) {
+  ///         value++;
+  ///       }
+  ///     }
+  ///
+  /// is converted into this top level method
+  ///
+  ///    B E|property(A #this, B value) {
+  ///      final #t1 = value;
+  ///      value++;
+  ///      return #t1;
+  ///    }
+  ///
+  void _updateExtensionSetterBody() {
+    if (isExtensionInstanceMember && isSetter) {
+      // TODO(johnniwinther): Avoid the synthetic variable if the parameter is
+      // never modified.
+      VariableDeclaration value = procedure.function.positionalParameters[1];
+      procedure.function.returnType = value.type;
+      Statement body = procedure.function.body;
+      List<Statement> statements = [];
+      Block block = new Block(statements);
+      VariableDeclaration variableDeclaration =
+          new VariableDeclarationJudgment.forValue(
+              new VariableGet(value)..fileOffset = procedure.fileOffset)
+            ..type = value.type;
+      statements.add(variableDeclaration);
+      if (body is Block) {
+        statements.addAll(body.statements);
+      } else {
+        statements.add(body);
+      }
+      ReturnStatement returnStatement = new ReturnStatement(
+          new VariableGet(variableDeclaration)
+            ..fileOffset = procedure.fileEndOffset);
+      statements.add(returnStatement);
+      setParents(block.statements, block);
+      procedure.function.body = block;
+      block.parent = procedure.function;
+    }
+  }
+
+  void set body(Statement newBody) {
+    super.body = newBody;
+    _updateExtensionSetterBody();
   }
 
   void set asyncModifier(AsyncMarker newModifier) {
@@ -550,7 +576,7 @@ class ProcedureBuilder extends FunctionBuilder {
       _procedure.isExternal = isExternal;
       _procedure.isConst = isConst;
       if (isExtensionMethod) {
-        ExtensionBuilder extension = parent;
+        ExtensionBuilder extensionBuilder = parent;
         procedure.isExtensionMember = true;
         procedure.isStatic = true;
         String kindInfix = '';
@@ -575,17 +601,168 @@ class ProcedureBuilder extends FunctionBuilder {
           procedure.kind = ProcedureKind.Method;
         }
         procedure.name = new Name(
-            '${extension.name}|${kindInfix}${name}', libraryBuilder.library);
+            '${extensionBuilder.name}|${kindInfix}${name}',
+            libraryBuilder.library);
       } else {
         _procedure.isStatic = isStatic;
         _procedure.name = new Name(name, libraryBuilder.library);
       }
     }
+    if (extensionTearOff != null) {
+      _buildExtensionTearOff(libraryBuilder, parent);
+    }
     return _procedure;
+  }
+
+  /// Creates a top level function that creates a tear off of an extension
+  /// instance method.
+  ///
+  /// For this declaration
+  ///
+  ///     extension E<T> on A<T> {
+  ///       X method<S>(S s, Y y) {}
+  ///     }
+  ///
+  /// we create the top level function
+  ///
+  ///     X E|method<T, S>(A<T> #this, S s, Y y) {}
+  ///
+  /// and the tear off function
+  ///
+  ///     X Function<S>(S, Y) E|get#method<T>(A<T> #this) {
+  ///       return (S s, Y y) => E|method<T, S>(#this, s, y);
+  ///     }
+  ///
+  void _buildExtensionTearOff(
+      SourceLibraryBuilder libraryBuilder, ExtensionBuilder extensionBuilder) {
+    assert(
+        _extensionTearOff != null, "No extension tear off created for $this.");
+    if (_extensionTearOff.name != null) return;
+
+    int fileOffset = _procedure.fileOffset;
+
+    int extensionTypeParameterCount =
+        extensionBuilder.typeParameters?.length ?? 0;
+
+    List<TypeParameter> typeParameters = <TypeParameter>[];
+
+    List<DartType> typeArguments = <DartType>[];
+    for (TypeParameter typeParameter in function.typeParameters) {
+      TypeParameter newTypeParameter = new TypeParameter(typeParameter.name);
+      typeParameters.add(newTypeParameter);
+      typeArguments.add(new TypeParameterType(newTypeParameter));
+    }
+
+    List<TypeParameter> tearOffTypeParameters = <TypeParameter>[];
+    List<TypeParameter> closureTypeParameters = <TypeParameter>[];
+    Substitution substitution =
+        Substitution.fromPairs(function.typeParameters, typeArguments);
+    for (int index = 0; index < typeParameters.length; index++) {
+      TypeParameter newTypeParameter = typeParameters[index];
+      newTypeParameter.bound =
+          substitution.substituteType(function.typeParameters[index].bound);
+      newTypeParameter.defaultType = function.typeParameters[index].defaultType;
+      if (index < extensionTypeParameterCount) {
+        tearOffTypeParameters.add(newTypeParameter);
+      } else {
+        closureTypeParameters.add(newTypeParameter);
+      }
+    }
+
+    VariableDeclaration copyParameter(
+        VariableDeclaration parameter, DartType type,
+        {bool isOptional}) {
+      // TODO(johnniwinther): Handle default values.
+      return new VariableDeclaration(parameter.name,
+          type: type,
+          initializer: isOptional ? new NullLiteral() : null,
+          isFinal: parameter.isFinal)
+        ..fileOffset = parameter.fileOffset;
+    }
+
+    VariableDeclaration extensionThis = copyParameter(
+        function.positionalParameters.first,
+        substitution.substituteType(function.positionalParameters.first.type),
+        isOptional: false);
+
+    DartType closureReturnType =
+        substitution.substituteType(function.returnType);
+    List<VariableDeclaration> closurePositionalParameters = [];
+    List<Expression> closurePositionalArguments = [];
+
+    for (int position = 0;
+        position < function.positionalParameters.length;
+        position++) {
+      VariableDeclaration parameter = function.positionalParameters[position];
+      if (position == 0) {
+        /// Pass `this` as a captured variable.
+        closurePositionalArguments
+            .add(new VariableGet(extensionThis)..fileOffset = fileOffset);
+      } else {
+        DartType type = substitution.substituteType(parameter.type);
+        VariableDeclaration newParameter = copyParameter(parameter, type,
+            isOptional: position >= function.requiredParameterCount);
+        closurePositionalParameters.add(newParameter);
+        closurePositionalArguments
+            .add(new VariableGet(newParameter)..fileOffset = fileOffset);
+      }
+    }
+    List<VariableDeclaration> closureNamedParameters = [];
+    List<NamedExpression> closureNamedArguments = [];
+    for (VariableDeclaration parameter in function.namedParameters) {
+      DartType type = substitution.substituteType(parameter.type);
+      VariableDeclaration newParameter =
+          copyParameter(parameter, type, isOptional: true);
+      closureNamedParameters.add(newParameter);
+      closureNamedArguments.add(new NamedExpression(parameter.name,
+          new VariableGet(newParameter)..fileOffset = fileOffset));
+    }
+
+    Statement closureBody = new ReturnStatement(
+        new StaticInvocation(
+            procedure,
+            new Arguments(closurePositionalArguments,
+                types: typeArguments, named: closureNamedArguments))
+          ..fileOffset = fileOffset)
+      ..fileOffset = fileOffset;
+
+    FunctionExpression closure = new FunctionExpression(new FunctionNode(
+        closureBody,
+        typeParameters: closureTypeParameters,
+        positionalParameters: closurePositionalParameters,
+        namedParameters: closureNamedParameters,
+        requiredParameterCount: procedure.function.requiredParameterCount - 1,
+        returnType: closureReturnType,
+        asyncMarker: procedure.function.asyncMarker,
+        dartAsyncMarker: procedure.function.dartAsyncMarker))
+      ..fileOffset = fileOffset;
+
+    _extensionTearOff
+      ..name = new Name(
+          '${extensionBuilder.name}|get#${name}', libraryBuilder.library)
+      ..function = new FunctionNode(
+          new ReturnStatement(closure)..fileOffset = fileOffset,
+          typeParameters: tearOffTypeParameters,
+          positionalParameters: [extensionThis],
+          requiredParameterCount: 1,
+          returnType: closure.function.functionType)
+      ..fileUri = fileUri
+      ..fileOffset = fileOffset;
+    _extensionTearOff.function.parent = _extensionTearOff;
   }
 
   /// The [Procedure] built by this builder.
   Procedure get procedure => isPatch ? origin.procedure : _procedure;
+
+  /// If this is an extension instance method then [_extensionTearOff] holds
+  /// the synthetically created tear off function.
+  Procedure get extensionTearOff {
+    if (isExtensionInstanceMember && kind == ProcedureKind.Method) {
+      _extensionTearOff ??= new Procedure(null, ProcedureKind.Method, null,
+          isStatic: true, isExtensionMember: true);
+    }
+    return _extensionTearOff;
+  }
 
   Member get member => procedure;
 
@@ -695,7 +872,7 @@ class ConstructorBuilder extends FunctionBuilder {
     return false;
   }
 
-  Constructor build(SourceLibraryBuilder libraryBuilder) {
+  Member build(SourceLibraryBuilder libraryBuilder) {
     if (_constructor.name == null) {
       _constructor.function = buildFunction(libraryBuilder);
       _constructor.function.parent = _constructor;
@@ -896,12 +1073,12 @@ class RedirectingFactoryBuilder extends ProcedureBuilder {
             nativeMethodName);
 
   @override
-  Statement get body => actualBody;
+  Statement get body => _body;
 
   @override
   void setRedirectingFactoryBody(Member target, List<DartType> typeArguments) {
-    if (actualBody != null) {
-      unexpected("null", "${actualBody.runtimeType}", charOffset, fileUri);
+    if (_body != null) {
+      unexpected("null", "${_body.runtimeType}", charOffset, fileUri);
     }
 
     // Ensure that constant factories only have constant targets/bodies.
@@ -910,9 +1087,9 @@ class RedirectingFactoryBuilder extends ProcedureBuilder {
           noLength, fileUri);
     }
 
-    actualBody = new RedirectingFactoryBody(target, typeArguments);
-    function.body = actualBody;
-    actualBody?.parent = function;
+    _body = new RedirectingFactoryBody(target, typeArguments);
+    function.body = _body;
+    _body?.parent = function;
     if (isPatch) {
       if (function.typeParameters != null) {
         Map<TypeParameter, DartType> substitution = <TypeParameter, DartType>{};

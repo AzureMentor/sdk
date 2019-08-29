@@ -293,7 +293,7 @@ abstract class ComplexAssignmentJudgment extends SyntheticExpressionJudgment {
   Expression read;
 
   /// The expression appearing on the RHS of the assignment.
-  final Expression rhs;
+  Expression rhs;
 
   /// The expression that performs the write (e.g. `a.[]=(b, a.[](b) + 1)` in
   /// `++a[b]`).
@@ -367,8 +367,8 @@ abstract class ComplexAssignmentJudgment extends SyntheticExpressionJudgment {
                 combinerTarget.member, readType);
       }
       DartType rhsType;
-      FunctionType combinerType = inferrer.getCalleeFunctionType(
-          inferrer.getCalleeType(combinerTarget, readType), false);
+      FunctionType combinerType =
+          inferrer.getFunctionType(combinerTarget, readType, false);
       if (isPreIncDec || isPostIncDec) {
         rhsType = inferrer.coreTypes.intClass.rawType;
       } else {
@@ -378,8 +378,12 @@ abstract class ComplexAssignmentJudgment extends SyntheticExpressionJudgment {
         assert(identical(combiner.arguments.positional.first, rhs));
         // Analyzer uses a null context for the RHS here.
         // TODO(paulberry): improve on this.
-        inferrer.inferExpression(rhs, const UnknownType(), true);
-        rhsType = getInferredType(rhs, inferrer);
+        ExpressionInferenceResult rhsResult =
+            inferrer.inferExpression(rhs, const UnknownType(), true);
+        if (rhsResult.replacement != null) {
+          rhs = rhsResult.replacement;
+        }
+        rhsType = rhsResult.inferredType;
         // Do not use rhs after this point because it may be a Shadow node
         // that has been replaced in the tree with its desugaring.
         DartType expectedType = getPositionalParameterType(combinerType, 0);
@@ -413,6 +417,9 @@ abstract class ComplexAssignmentJudgment extends SyntheticExpressionJudgment {
       ExpressionInferenceResult rhsResult = inferrer.inferExpression(
           rhs, writeContext ?? const UnknownType(), true,
           isVoidAllowed: true);
+      if (rhsResult.replacement != null) {
+        rhs = rhsResult.replacement;
+      }
       DartType rhsType = rhsResult.inferredType;
       Expression replacedRhs = inferrer.ensureAssignable(
           writeContext, rhsType, rhs, writeOffset,
@@ -787,7 +794,7 @@ abstract class InitializerJudgment implements Initializer {
 Expression checkWebIntLiteralsErrorIfUnexact(
     ShadowTypeInferrer inferrer, int value, String literal, int charOffset) {
   if (value >= 0 && value <= (1 << 53)) return null;
-  if (inferrer.library == null) return null;
+  if (inferrer.isTopLevel) return null;
   if (!inferrer.library.loader.target.backendTarget
       .errorOnUnexactWebIntLiterals) return null;
   BigInt asInt = BigInt.from(value).toUnsigned(64);
@@ -1088,10 +1095,9 @@ class RedirectingInitializerJudgment extends RedirectingInitializer
 
 /// Concrete shadow object representing a return statement in kernel form.
 class ReturnJudgment extends ReturnStatement implements StatementJudgment {
-  final String returnKeywordLexeme;
+  final bool isArrow;
 
-  ReturnJudgment(this.returnKeywordLexeme, [Expression expression])
-      : super(expression);
+  ReturnJudgment(this.isArrow, [Expression expression]) : super(expression);
 
   Expression get judgment => expression;
 
@@ -1275,9 +1281,10 @@ class SyntheticExpressionJudgment extends Let implements ExpressionJudgment {
 
   /// Removes this expression from the expression tree, replacing it with
   /// [desugared].
-  void _replaceWithDesugared() {
+  Expression _replaceWithDesugared() {
     parent.replaceChild(this, desugared);
     parent = null;
+    return desugared;
   }
 
   /// Updates any [Let] nodes in the desugared expression to account for the
@@ -1626,9 +1633,9 @@ class VariableDeclarationJudgment extends VariableDeclaration
         _isLocalFunction = false,
         super.forValue(initializer);
 
-  VariableDeclarationJudgment.forValue(
-      Expression initializer, this._functionNestingLevel)
+  VariableDeclarationJudgment.forValue(Expression initializer)
       : forSyntheticToken = false,
+        _functionNestingLevel = 0,
         _implicitlyTyped = true,
         _isLocalFunction = false,
         super.forValue(initializer);

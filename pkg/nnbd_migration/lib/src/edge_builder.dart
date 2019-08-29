@@ -186,25 +186,14 @@ class EdgeBuilder extends GeneralizingAstVisitor<DecoratedType>
   DecoratedType getOrComputeElementType(Element element,
       {DecoratedType targetType}) {
     Map<TypeParameterElement, DecoratedType> substitution;
-    Element baseElement;
-    if (element is Member) {
-      assert(targetType != null);
-      baseElement = element.baseElement;
-      var targetTypeType = targetType.type;
-      if (targetTypeType is InterfaceType &&
-          baseElement is ClassMemberElement) {
-        var enclosingClass = baseElement.enclosingElement as ClassElement;
-        assert(targetTypeType.element == enclosingClass); // TODO(paulberry)
-        substitution = <TypeParameterElement, DecoratedType>{};
-        assert(enclosingClass.typeParameters.length ==
-            targetTypeType.typeArguments.length); // TODO(paulberry)
-        for (int i = 0; i < enclosingClass.typeParameters.length; i++) {
-          substitution[enclosingClass.typeParameters[i]] =
-              targetType.typeArguments[i];
-        }
+    Element baseElement = element is Member ? element.baseElement : element;
+    if (targetType != null) {
+      var classElement = baseElement.enclosingElement as ClassElement;
+      if (classElement.typeParameters.isNotEmpty) {
+        substitution = _decoratedClassHierarchy
+            .asInstanceOf(targetType, classElement)
+            .asSubstitution;
       }
-    } else {
-      baseElement = element;
     }
     DecoratedType decoratedBaseType;
     if (baseElement is PropertyAccessorElement &&
@@ -229,6 +218,8 @@ class EdgeBuilder extends GeneralizingAstVisitor<DecoratedType>
       if (element is MethodElement) {
         elementType = element.type;
       } else if (element is ConstructorElement) {
+        elementType = element.type;
+      } else if (element is PropertyAccessorMember) {
         elementType = element.type;
       } else {
         throw element.runtimeType; // TODO(paulberry)
@@ -767,7 +758,15 @@ class EdgeBuilder extends GeneralizingAstVisitor<DecoratedType>
           .map((t) => _variables.decoratedTypeAnnotation(source, t))
           .toList();
     } else {
-      decoratedTypeArguments = const [];
+      var staticType = node.staticType;
+      if (staticType is InterfaceType) {
+        decoratedTypeArguments = staticType.typeArguments
+            .map((t) => DecoratedType.forImplicitType(_typeProvider, t, _graph))
+            .toList();
+      } else {
+        // Note: this could happen if the code being migrated has errors.
+        decoratedTypeArguments = const [];
+      }
     }
     var createdType = DecoratedType(node.staticType, _graph.never,
         typeArguments: decoratedTypeArguments);
@@ -1675,6 +1674,9 @@ class EdgeBuilder extends GeneralizingAstVisitor<DecoratedType>
                   DecoratedType.forImplicitType(_typeProvider, argType, _graph))
               .toList();
           calleeType = calleeType.instantiate(argumentTypes);
+        } else if (constructorTypeParameters != null) {
+          // No need to instantiate; caller has already substituted in the
+          // correct type arguments.
         } else {
           assert(
               false,

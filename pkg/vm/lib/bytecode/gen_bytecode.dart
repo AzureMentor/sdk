@@ -2417,7 +2417,7 @@ class BytecodeGenerator extends RecursiveVisitor<Null> {
   /// the last finally block.
   void _generateNonLocalControlTransfer(
       TreeNode from, TreeNode to, GenerateContinuation continuation) {
-    if (options.emitDebuggerStops) {
+    if (options.emitDebuggerStops && from.fileOffset != TreeNode.noOffset) {
       asm.emitDebugCheck(); // Before context is unwound.
     }
     List<TryFinally> tryFinallyBlocks = _getEnclosingTryFinallyBlocks(from, to);
@@ -3174,6 +3174,10 @@ class BytecodeGenerator extends RecursiveVisitor<Null> {
   @override
   visitThrow(Throw node) {
     _generateNode(node.expression);
+
+    if (options.emitDebuggerStops) {
+      asm.emitDebugCheck();
+    }
     asm.emitThrow(0);
   }
 
@@ -3761,7 +3765,9 @@ class BytecodeGenerator extends RecursiveVisitor<Null> {
 
     bool hasCatchAll = false;
 
+    final savedSourcePosition = asm.currentSourcePosition;
     for (Catch catchClause in node.catches) {
+      _recordSourcePosition(catchClause.fileOffset);
       tryBlock.types.add(cp.addType(catchClause.guard));
 
       Label skipCatch;
@@ -3799,6 +3805,7 @@ class BytecodeGenerator extends RecursiveVisitor<Null> {
         asm.bind(skipCatch);
       }
     }
+    asm.currentSourcePosition = savedSourcePosition;
 
     if (!hasCatchAll) {
       tryBlock.needsStackTrace = true;

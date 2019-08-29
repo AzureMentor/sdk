@@ -589,7 +589,7 @@ class BodyBuilder extends ScopeListener<JumpTarget>
   }
 
   @override
-  void endFields(Token staticToken, Token covariantToken, Token lateToken,
+  void endClassFields(Token staticToken, Token covariantToken, Token lateToken,
       Token varFinalOrConst, int count, Token beginToken, Token endToken) {
     debugEvent("Fields");
     if (!libraryBuilder.loader.target.enableNonNullable) {
@@ -1209,7 +1209,7 @@ class BodyBuilder extends ScopeListener<JumpTarget>
               .withLocation(uri, eof.charOffset, eof.length));
     }
 
-    ReturnJudgment fakeReturn = new ReturnJudgment(null, expression);
+    ReturnJudgment fakeReturn = new ReturnJudgment(true, expression);
 
     typeInferrer?.inferFunctionBody(
         this, const DynamicType(), AsyncMarker.Sync, fakeReturn);
@@ -1436,9 +1436,8 @@ class BodyBuilder extends ScopeListener<JumpTarget>
       push(new VariableUseGenerator(this, token, expression.variable));
       expression.extend();
     } else {
-      VariableDeclaration variable = new VariableDeclarationJudgment.forValue(
-          expression, functionNestingLevel)
-        ..fileOffset = expression.fileOffset;
+      VariableDeclaration variable = forest.createVariableDeclarationForValue(
+          expression.fileOffset, expression);
       push(new CascadeJudgment(variable)..fileOffset = expression.fileOffset);
       push(new VariableUseGenerator(this, token, variable));
     }
@@ -1788,12 +1787,10 @@ class BodyBuilder extends ScopeListener<JumpTarget>
 
   @override
   Expression createExtensionTearOff(
+      int fileOffset,
       Procedure procedure,
       VariableDeclaration extensionThis,
-      List<TypeParameter> extensionTypeParameters,
-      Token token) {
-    int charOffset = offsetForToken(token);
-
+      List<TypeParameter> extensionTypeParameters) {
     FunctionNode function = procedure.function;
     List<TypeParameter> typeParameters = [];
     List<DartType> typeArguments = [];
@@ -1836,7 +1833,8 @@ class BodyBuilder extends ScopeListener<JumpTarget>
       return forest.createVariableDeclaration(
           parameter.name, functionNestingLevel,
           type: substitution.substituteType(parameter.type),
-          initializer: isOptional ? forest.createNullLiteral(token) : null);
+          initializer:
+              isOptional ? forest.createNullLiteral(fileOffset) : null);
     }
 
     for (int position = 0;
@@ -1845,12 +1843,12 @@ class BodyBuilder extends ScopeListener<JumpTarget>
       VariableDeclaration parameter = function.positionalParameters[position];
       if (position == 0) {
         /// Pass `this` as a captured variable.
-        positionalArguments.add(createVariableGet(extensionThis, charOffset));
+        positionalArguments.add(createVariableGet(extensionThis, fileOffset));
       } else {
         VariableDeclaration newParameter = copyParameter(parameter,
             isOptional: position >= function.requiredParameterCount);
         positionalParameters.add(newParameter);
-        positionalArguments.add(createVariableGet(newParameter, charOffset));
+        positionalArguments.add(createVariableGet(newParameter, fileOffset));
       }
     }
     List<VariableDeclaration> namedParameters = [];
@@ -1860,19 +1858,19 @@ class BodyBuilder extends ScopeListener<JumpTarget>
           copyParameter(parameter, isOptional: true);
       namedParameters.add(newParameter);
       namedArguments.add(forest.createNamedExpression(
-          parameter.name, createVariableGet(newParameter, charOffset)));
+          parameter.name, createVariableGet(newParameter, fileOffset)));
     }
 
     Statement body = forest.createReturnStatement(
-        null,
+        fileOffset,
         buildStaticInvocation(
             procedure,
-            forest.createArguments(charOffset, positionalArguments,
+            forest.createArguments(fileOffset, positionalArguments,
                 types: typeArguments, named: namedArguments),
-            charOffset: charOffset),
-        charOffset);
+            charOffset: fileOffset));
 
     FunctionExpression expression = forest.createFunctionExpression(
+        fileOffset,
         forest.createFunctionNode(body,
             typeParameters: typeParameters,
             positionalParameters: positionalParameters,
@@ -1881,8 +1879,7 @@ class BodyBuilder extends ScopeListener<JumpTarget>
                 procedure.function.requiredParameterCount - 1,
             returnType: returnType,
             asyncMarker: procedure.function.asyncMarker,
-            dartAsyncMarker: procedure.function.dartAsyncMarker),
-        charOffset);
+            dartAsyncMarker: procedure.function.dartAsyncMarker));
     functionNestingLevel--;
     return expression;
   }
@@ -2211,8 +2208,8 @@ class BodyBuilder extends ScopeListener<JumpTarget>
       push(buildProblemStatement(
           fasta.messageConstructorWithReturnType, beginToken.charOffset));
     } else {
-      push(forest.createReturnStatement(
-          beginToken, expression, offsetForToken(beginToken)));
+      push(forest.createReturnStatement(offsetForToken(beginToken), expression,
+          isArrow: !identical(beginToken.lexeme, "return")));
     }
   }
 
@@ -2319,7 +2316,7 @@ class BodyBuilder extends ScopeListener<JumpTarget>
     debugEvent("NoFieldInitializer");
     if (constantContext == ConstantContext.inferred) {
       // Creating a null value to prevent the Dart VM from crashing.
-      push(forest.createNullLiteral(token));
+      push(forest.createNullLiteral(offsetForToken(token)));
     } else {
       push(NullValue.FieldInitializer);
     }
@@ -2794,7 +2791,7 @@ class BodyBuilder extends ScopeListener<JumpTarget>
   @override
   void handleLiteralNull(Token token) {
     debugEvent("LiteralNull");
-    push(forest.createNullLiteral(token));
+    push(forest.createNullLiteral(offsetForToken(token)));
   }
 
   void buildLiteralMap(List<UnresolvedType> typeArguments, Token constKeyword,
@@ -4377,7 +4374,7 @@ class BodyBuilder extends ScopeListener<JumpTarget>
 
   VariableDeclaration buildForInVariable(Object lvalue) {
     if (lvalue is VariableDeclaration) return lvalue;
-    return new VariableDeclarationJudgment.forValue(null, functionNestingLevel);
+    return forest.createVariableDeclarationForValue(noLocation, null);
   }
 
   Expression checkForInVariable(

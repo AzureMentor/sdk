@@ -1969,12 +1969,48 @@ C<Object> f() => C<dynamic>();
         hard: false);
   }
 
+  test_instanceCreation_generic_inferredParameterType() async {
+    await analyze('''
+class C<T> {
+  C(List<T> x);
+}
+C<int> f(List<int> x) => C(x);
+''');
+    var edge = assertEdge(anyNode, decoratedTypeAnnotation('int> f').node,
+        hard: false);
+    var inferredTypeArgument = edge.primarySource;
+    assertEdge(
+        decoratedTypeAnnotation('int> x').node,
+        substitutionNode(
+            inferredTypeArgument, decoratedTypeAnnotation('T> x').node),
+        hard: false);
+  }
+
   test_instanceCreation_generic_parameter() async {
     await analyze('''
 class C<T> {
   C(T t);
 }
 f(int i) => C<int>(i/*check*/);
+''');
+    var nullable_i = decoratedTypeAnnotation('int i').node;
+    var nullable_c_t = decoratedTypeAnnotation('C<int>').typeArguments[0].node;
+    var nullable_t = decoratedTypeAnnotation('T t').node;
+    var check_i = checkExpression('i/*check*/');
+    var nullable_c_t_or_nullable_t =
+        check_i.edges.single.destinationNode as NullabilityNodeForSubstitution;
+    expect(nullable_c_t_or_nullable_t.innerNode, same(nullable_c_t));
+    expect(nullable_c_t_or_nullable_t.outerNode, same(nullable_t));
+    assertNullCheck(check_i,
+        assertEdge(nullable_i, nullable_c_t_or_nullable_t, hard: true));
+  }
+
+  test_instanceCreation_generic_parameter_named() async {
+    await analyze('''
+class C<T> {
+  C({T t});
+}
+f(int i) => C<int>(t: i/*check*/);
 ''');
     var nullable_i = decoratedTypeAnnotation('int i').node;
     var nullable_c_t = decoratedTypeAnnotation('C<int>').typeArguments[0].node;
@@ -2466,6 +2502,23 @@ void test(C c) {
 ''');
 
     assertEdge(decoratedTypeAnnotation('C c').node, never, hard: true);
+  }
+
+  test_methodInvocation_target_generic_in_base_class() async {
+    await analyze('''
+abstract class B<T> {
+  void m(T/*1*/ t);
+}
+abstract class C extends B<int/*2*/> {}
+void f(C c, int/*3*/ i) {
+  c.m(i);
+}
+''');
+    // nullable(3) -> substitute(nullable(2), nullable(1))
+    var nullable1 = decoratedTypeAnnotation('T/*1*/').node;
+    var nullable2 = decoratedTypeAnnotation('int/*2*/').node;
+    var nullable3 = decoratedTypeAnnotation('int/*3*/').node;
+    assertEdge(nullable3, substitutionNode(nullable2, nullable1), hard: true);
   }
 
   test_methodInvocation_typeParameter_inferred() async {
@@ -3321,6 +3374,24 @@ bool f(C c) => c.b;
 ''');
     assertEdge(decoratedTypeAnnotation('bool get').node,
         decoratedTypeAnnotation('bool f').node,
+        hard: false);
+  }
+
+  test_prefixedIdentifier_getter_type_in_generic() async {
+    await analyze('''
+class C<T> {
+  List<T> _x;
+  List<T> get x => _x;
+}
+List<int> f(C<int> c) => c.x;
+''');
+    assertEdge(decoratedTypeAnnotation('List<T> get').node,
+        decoratedTypeAnnotation('List<int> f').node,
+        hard: false);
+    assertEdge(
+        substitutionNode(decoratedTypeAnnotation('int> c').node,
+            decoratedTypeAnnotation('T> get').node),
+        decoratedTypeAnnotation('int> f').node,
         hard: false);
   }
 

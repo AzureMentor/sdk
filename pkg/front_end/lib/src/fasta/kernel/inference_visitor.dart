@@ -577,8 +577,8 @@ class InferenceVisitor
     // To replicate analyzer behavior, we base type inference on the write
     // member.  TODO(paulberry): would it be better to use the read member
     // when doing compound assignment?
-    FunctionType calleeType = inferrer.getCalleeFunctionType(
-        inferrer.getCalleeType(writeTarget, receiverType), false);
+    FunctionType calleeType =
+        inferrer.getFunctionType(writeTarget, receiverType, false);
     DartType expectedIndexTypeForWrite;
     DartType indexContext = const UnknownType();
     DartType writeContext = const UnknownType();
@@ -604,8 +604,8 @@ class InferenceVisitor
     if (read != null) {
       ObjectAccessTarget readMember = inferrer
           .findMethodInvocationMember(receiverType, read, instrumented: false);
-      FunctionType calleeFunctionType = inferrer.getCalleeFunctionType(
-          inferrer.getCalleeType(readMember, receiverType), false);
+      FunctionType calleeFunctionType =
+          inferrer.getFunctionType(readMember, receiverType, false);
       inferrer.ensureAssignable(
           getPositionalParameterType(calleeFunctionType, 0),
           indexType,
@@ -1681,7 +1681,7 @@ class InferenceVisitor
     if (node.read != null) {
       ObjectAccessTarget readTarget = inferrer
           .findPropertyGetMember(receiverType, node.read, instrumented: false);
-      readType = inferrer.getCalleeType(readTarget, receiverType);
+      readType = inferrer.getGetterType(readTarget, receiverType);
       inferrer.handlePropertyGetContravariance(
           node.receiver,
           readTarget,
@@ -1702,8 +1702,21 @@ class InferenceVisitor
     DartType inferredType =
         node._inferRhs(inferrer, readType, writeContext).inferredType;
     node.nullAwareGuard?.staticType = node.inferredType;
-    node._replaceWithDesugared();
-    return new ExpressionInferenceResult(inferredType);
+    Expression replacement;
+    if (writeTarget.isExtensionMember) {
+      node.parent.replaceChild(
+          node,
+          replacement = inferrer.helper.forest.createStaticInvocation(
+              node.fileOffset,
+              writeTarget.member,
+              inferrer.helper.forest.createArguments(
+                  node.fileOffset, [node.receiver, node.rhs])));
+      inferrer.storeInferredType(replacement, inferredType);
+    } else {
+      node._replaceWithDesugared();
+    }
+
+    return new ExpressionInferenceResult(inferredType, replacement);
   }
 
   @override
@@ -1711,7 +1724,7 @@ class InferenceVisitor
       PropertyGet node, DartType typeContext) {
     return inferrer.inferPropertyGet(
         node, node.receiver, node.fileOffset, typeContext,
-        desugaredGet: node);
+        desugaredGet: node, allowExtensionMethods: true);
   }
 
   void visitRedirectingInitializerJudgment(
@@ -1753,8 +1766,7 @@ class InferenceVisitor
     } else {
       inferredType = inferrer.coreTypes.nullClass.rawType;
     }
-    closureContext.handleReturn(inferrer, node, inferredType,
-        !identical(node.returnKeywordLexeme, "return"));
+    closureContext.handleReturn(inferrer, node, inferredType, node.isArrow);
   }
 
   ExpressionInferenceResult visitSetLiteralJudgment(
@@ -1881,8 +1893,10 @@ class InferenceVisitor
     DartType inferredType = inferrer.inferInvocation(typeContext,
         node.fileOffset, calleeType, calleeType.returnType, node.arguments);
     inferrer.storeInferredType(node, inferredType);
-    if (!hadExplicitTypeArguments && node.target != null) {
-      inferrer.library?.checkBoundsInStaticInvocation(
+    if (!inferrer.isTopLevel &&
+        !hadExplicitTypeArguments &&
+        node.target != null) {
+      inferrer.library.checkBoundsInStaticInvocation(
           node, inferrer.typeSchemaEnvironment, inferrer.helper.uri,
           inferred: true);
     }
